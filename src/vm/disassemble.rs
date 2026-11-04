@@ -10,16 +10,22 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
+use std::mem;
 use std::ops::ControlFlow;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, ScopedJoinHandle};
 
 use anyhow::{Result, bail};
 use indexmap::IndexSet;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use swc_core::ecma::ast::BinaryOp;
 
 use super::interpret::Way;
-use super::machine::{Loaded, Machine};
-use super::output::{Constant, Effect, Exit, Hidden, Instruction, Listing, Path, Position, Term};
+use super::machine::{Definition, Loaded, Machine};
+use super::output::{
+    Constant, Effect, Exit, Failure, Hidden, Instruction, Listing, Path, Position, Term,
+};
 use super::value::Value;
 use super::{HashMap, convert, dataflow, packed_names};
 use crate::candidates;
@@ -50,17 +56,15 @@ impl Machine<'_> {
             walk.enqueue(entry)?;
         }
         let loaded = self.load(program);
-        loop {
-            while let Some(Position { pc, key }) = walk.queue.pop_front() {
-                match self.decode(&loaded, pc, key, &[]) {
-                    Ok(instruction) => walk.add(self, &loaded, instruction)?,
-                    Err(failure) => walk.listing.failures.push(failure),
+        thread::scope(|scope| -> Result<()> {
+            let decoders = Decoders::start(scope, self.definition, program);
+            loop {
+                decoders.walk(&mut walk, self, &loaded)?;
+                if !(walk.retry(self, &loaded)? || walk.drop_shortcuts()) {
+                    return Ok(());
                 }
             }
-            if !(walk.retry(self, &loaded)? || walk.drop_shortcuts()) {
-                break;
-            }
-        }
+        })?;
         let mut listing = walk.listing;
         // Discovery order must not affect the output.
         listing.functions[1..].sort_unstable();
@@ -72,6 +76,330 @@ impl Machine<'_> {
         packed_names::fold(&mut listing);
         Ok(listing)
     }
+}
+
+/// Threads that decode positions alongside the walk, each with a machine of its own: the
+/// interpreter's values are not shareable, but a decoded [`Instruction`] is plain data.
+///
+/// Decoding a position reads only the program and the machine, never the walk, so positions can
+/// be decoded in any order and on any thread. Whoever decodes an instruction queues the positions
+/// it leads to ([`successors`]), which the walk will reach once it adds the instruction, so the
+/// decoding runs ahead of the walk across every branch at once. The walk still adds instructions
+/// in the order it reaches them, which makes the listing the one a single thread would produce.
+struct Decoders<'scope> {
+    queue: Arc<Queue>,
+    decoded: Receiver<(Position, Decoded)>,
+    /// Kept so the channel stays open while no worker has started.
+    _sender: Sender<(Position, Decoded)>,
+    _workers: Vec<ScopedJoinHandle<'scope, ()>>,
+}
+
+/// What decoding one position gave, or why a worker could not start.
+enum Decoded {
+    Instruction(Result<Read, Failure>),
+    Unavailable(anyhow::Error),
+}
+
+/// A decoded instruction and the shortcuts of the hidden branches it may hold, worked out with it
+/// because they too read only the program and the machine.
+struct Read {
+    instruction: Instruction,
+    shortcuts: Vec<(u8, Option<Shortcut>)>,
+}
+
+impl Read {
+    fn at<'a>(
+        machine: &Machine<'a>,
+        loaded: &Loaded<'_, 'a>,
+        position: Position,
+    ) -> Result<Self, Failure> {
+        let instruction = machine.decode(loaded, position.pc, position.key, &[])?;
+        let (pc, key) = (instruction.pc, instruction.key);
+        let shortcuts = compared_registers(&instruction)
+            .into_iter()
+            .map(|register| {
+                let shortcut = Shortcut::learn(machine, loaded, pc, key, register);
+                (register, shortcut)
+            })
+            .collect();
+        Ok(Self {
+            instruction,
+            shortcuts,
+        })
+    }
+}
+
+/// The registers `instruction` compares with control flow the interpreter cannot resolve, which
+/// may hide a branch.
+fn compared_registers(instruction: &Instruction) -> BTreeSet<u8> {
+    let mut registers = BTreeSet::new();
+    let unfollowed = instruction
+        .paths
+        .iter()
+        .filter(|path| matches!(path.exit, Exit::Unfollowed { .. }))
+        .flat_map(|path| &path.conditions);
+    for (condition, _) in unfollowed {
+        condition.visit(&mut |term| {
+            if let Term::Reg(register) = term {
+                registers.insert(*register);
+            }
+        });
+    }
+    registers
+}
+
+#[derive(Default)]
+struct Queue {
+    waiting: Mutex<Waiting>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    /// Positions the walk has reached, decoded first.
+    reached: VecDeque<Position>,
+    /// Positions decoded instructions lead to, which the walk will reach.
+    ahead: VecDeque<Position>,
+    /// Positions taken for decoding.
+    taken: FxHashSet<Position>,
+    closed: bool,
+}
+
+impl Waiting {
+    fn next(&mut self) -> Option<Position> {
+        while let Some(position) = self.reached.pop_front().or_else(|| self.ahead.pop_front()) {
+            if self.taken.insert(position) {
+                return Some(position);
+            }
+        }
+        None
+    }
+}
+
+impl Queue {
+    /// Queues positions the walk reached, unless they are already taken.
+    fn reach(&self, positions: impl IntoIterator<Item = Position>) {
+        let mut waiting = self.waiting.lock().expect("decode queue lock");
+        let before = waiting.reached.len();
+        for position in positions {
+            if !waiting.taken.contains(&position) {
+                waiting.reached.push_back(position);
+            }
+        }
+        Self::wake(&self.ready, waiting.reached.len() - before);
+    }
+
+    /// Queues the positions `instruction` leads to.
+    fn look_ahead(&self, instruction: &Instruction) {
+        let mut waiting = self.waiting.lock().expect("decode queue lock");
+        let before = waiting.ahead.len();
+        for path in &instruction.paths {
+            for position in successors(instruction.pc, path, |_| {}) {
+                if !waiting.taken.contains(&position) {
+                    waiting.ahead.push_back(position);
+                }
+            }
+        }
+        Self::wake(&self.ready, waiting.ahead.len() - before);
+    }
+
+    fn wake(ready: &Condvar, added: usize) {
+        match added {
+            0 => {}
+            1 => ready.notify_one(),
+            _ => ready.notify_all(),
+        }
+    }
+
+    /// Takes a position to decode without waiting, marking it taken; `false` if it is taken.
+    fn take_this(&self, position: Position) -> bool {
+        self.waiting
+            .lock()
+            .expect("decode queue lock")
+            .taken
+            .insert(position)
+    }
+
+    /// The next position to decode, without waiting.
+    fn take(&self) -> Option<Position> {
+        self.waiting.lock().expect("decode queue lock").next()
+    }
+
+    /// The next position to decode, waiting for one; `None` once the queue closes.
+    fn wait(&self) -> Option<Position> {
+        let mut waiting = self.waiting.lock().expect("decode queue lock");
+        loop {
+            if waiting.closed {
+                return None;
+            }
+            if let Some(next) = waiting.next() {
+                return Some(next);
+            }
+            waiting = self.ready.wait(waiting).expect("decode queue lock");
+        }
+    }
+
+    fn close(&self) {
+        self.waiting.lock().expect("decode queue lock").closed = true;
+        self.ready.notify_all();
+    }
+}
+
+/// Decoding threads beside the walk's own: enough to keep a few cores busy, while leaving room
+/// for other work on the machine.
+fn decoding_threads() -> usize {
+    thread::available_parallelism().map_or(1, |cores| cores.get().min(8)) - 1
+}
+
+impl<'scope> Decoders<'scope> {
+    fn start<'env>(
+        scope: &'scope thread::Scope<'scope, 'env>,
+        definition: &'env Definition,
+        program: &'env [u8],
+    ) -> Self {
+        let queue = Arc::new(Queue::default());
+        let (sender, decoded) = mpsc::channel();
+        let workers = (0..decoding_threads())
+            .map(|_| {
+                let (queue, sender) = (queue.clone(), sender.clone());
+                scope.spawn(move || {
+                    let machine = match Machine::try_new(definition) {
+                        Ok(machine) => machine,
+                        Err(error) => {
+                            let _ = sender.send((Position::new(0, 0), Decoded::Unavailable(error)));
+                            return;
+                        }
+                    };
+                    let loaded = machine.load(program);
+                    while let Some(position) = queue.wait() {
+                        let read = Read::at(&machine, &loaded, position);
+                        if let Ok(read) = &read {
+                            queue.look_ahead(&read.instruction);
+                        }
+                        if sender.send((position, Decoded::Instruction(read))).is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        Self {
+            queue,
+            decoded,
+            _sender: sender,
+            _workers: workers,
+        }
+    }
+
+    /// Empties the walk's queue: adds each queued position's instruction in queue order,
+    /// decoding positions itself while the one it needs is not ready, and queueing what each
+    /// reaches.
+    fn walk<'a>(
+        &self,
+        walk: &mut Walk,
+        machine: &Machine<'a>,
+        loaded: &Loaded<'_, 'a>,
+    ) -> Result<()> {
+        // The walk's positions in the order it reached them, and the instructions decoded
+        // before the walk needed them.
+        let mut order: VecDeque<Position> = VecDeque::new();
+        let mut decoded: HashMap<Position, Result<Read, Failure>> = HashMap::default();
+        let reach = |walk: &mut Walk, order: &mut VecDeque<Position>| {
+            let reached: Vec<Position> = walk.queue.drain(..).collect();
+            self.queue.reach(reached.iter().copied());
+            order.extend(reached);
+        };
+        reach(walk, &mut order);
+        while let Some(position) = order.pop_front() {
+            let instruction = loop {
+                if let Some(instruction) = decoded.remove(&position) {
+                    break instruction;
+                }
+                // Decode what is needed now if nobody has taken it, else whatever is queued,
+                // and otherwise wait for the workers.
+                let (at, result) = if self.queue.take_this(position) {
+                    (
+                        position,
+                        Decoded::Instruction(self.decode(machine, loaded, position)),
+                    )
+                } else if let Ok(answer) = self.decoded.try_recv() {
+                    answer
+                } else if let Some(other) = self.queue.take() {
+                    (
+                        other,
+                        Decoded::Instruction(self.decode(machine, loaded, other)),
+                    )
+                } else {
+                    self.decoded.recv().expect("the walk keeps a sender")
+                };
+                match result {
+                    Decoded::Instruction(instruction) => {
+                        decoded.insert(at, instruction);
+                    }
+                    Decoded::Unavailable(error) => {
+                        return Err(error.context("starting a decoding thread"));
+                    }
+                }
+            };
+            match instruction {
+                Ok(read) => walk.add(read)?,
+                Err(failure) => walk.listing.failures.push(failure),
+            }
+            // A hidden branch is revealed by a probe and a candidate string; its code often
+            // leads to the next one. Retrying as soon as either turns up, rather than once the
+            // queue drains, lets the code behind it be decoded alongside the rest.
+            if walk.found != walk.retried {
+                walk.retry(machine, loaded)?;
+            }
+            reach(walk, &mut order);
+        }
+        Ok(())
+    }
+
+    /// Decodes `position` on the walk's own thread, looking ahead as the workers do.
+    fn decode<'a>(
+        &self,
+        machine: &Machine<'a>,
+        loaded: &Loaded<'_, 'a>,
+        position: Position,
+    ) -> Result<Read, Failure> {
+        let read = Read::at(machine, loaded, position);
+        if let Ok(read) = &read {
+            self.queue.look_ahead(&read.instruction);
+        }
+        read
+    }
+}
+
+impl Drop for Decoders<'_> {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
+/// The positions `path` of the instruction at `from` leads to: where it continues, the functions
+/// it creates and the exception handlers it installs. Calls `each` with every term of its
+/// effects.
+fn successors(from: u32, path: &Path, mut each: impl FnMut(&Term)) -> Vec<Position> {
+    let continues = match &path.exit {
+        // Handlers update a local program counter and store it when they finish. If a handler
+        // stops early, the stored counter remains just past the opcode, pointing into its
+        // operands.
+        Exit::Unfollowed { pc, .. } if *pc == from + 1 => None,
+        exit => exit.continues_at(),
+    };
+    let mut next: Vec<Position> = continues.into_iter().collect();
+    for effect in &path.effects {
+        effect.visit_terms(&mut |term| {
+            match term {
+                Term::Closure { pc, key, .. } => next.push(Position::new(*pc, *key)),
+                Term::Array(frame) => next.extend(catch_frame(frame)),
+                _ => {}
+            }
+            each(term);
+        });
+    }
+    next
 }
 
 #[derive(Default)]
@@ -90,6 +418,9 @@ struct Walk {
     probes: BTreeMap<(u32, u8), Probe>,
     /// Candidate hashes indexed by the instance field that caches them (see [`Shortcut`]).
     hashes: HashMap<String, HashMap<String, f64>>,
+    /// Probes and candidates found so far, and how many of them the last retry saw.
+    found: u64,
+    retried: u64,
 }
 
 /// A compare that may hide a branch, retried with candidate strings.
@@ -97,9 +428,12 @@ struct Probe {
     key: u8,
     /// Where the compare goes when the string does not match.
     fallthrough: Option<Position>,
-    /// How many of [`Walk::candidates`] it has been tried with.
+    /// How many of [`Walk::candidates`] it has been offered.
     tried: usize,
     shortcut: Option<Shortcut>,
+    /// Indices of the candidates its shortcut ruled out rather than ran. Dropping the shortcut
+    /// runs these; the others already ran and revealed nothing.
+    skipped: Vec<usize>,
 }
 
 impl Walk {
@@ -124,74 +458,56 @@ impl Walk {
         }
     }
 
-    fn add<'a>(
-        &mut self,
-        machine: &Machine<'a>,
-        loaded: &Loaded<'_, 'a>,
-        instruction: Instruction,
-    ) -> Result<()> {
+    fn add(&mut self, read: Read) -> Result<()> {
+        let Read {
+            instruction,
+            shortcuts,
+        } = read;
         self.from = Some(instruction.pc);
         for path in &instruction.paths {
             self.follow(path)?;
-        }
-        // A comparison with register-dependent control flow that the interpreter cannot resolve
-        // may hide a branch.
-        let mut registers = BTreeSet::new();
-        let unfollowed = instruction
-            .paths
-            .iter()
-            .filter(|path| matches!(path.exit, Exit::Unfollowed { .. }))
-            .flat_map(|path| &path.conditions);
-        for (condition, _) in unfollowed {
-            condition.visit(&mut |term| {
-                if let Term::Reg(register) = term {
-                    registers.insert(*register);
-                }
-            });
         }
         let fallthrough = instruction
             .paths
             .iter()
             .find_map(|path| path.exit.continues_at());
         let (pc, key) = (instruction.pc, instruction.key);
-        for register in registers {
+        for (register, shortcut) in shortcuts {
             let probe = Probe {
                 key,
                 fallthrough,
                 tried: 0,
-                shortcut: Shortcut::learn(machine, loaded, pc, key, register),
+                shortcut,
+                skipped: Vec::new(),
             };
             self.probes.insert((pc, register), probe);
+            self.found += 1;
         }
         self.listing.instructions.insert(pc, instruction);
         Ok(())
     }
 
     fn follow(&mut self, path: &Path) -> Result<()> {
-        let continues = match &path.exit {
-            // Handlers update a local program counter and store it when they finish. If a handler
-            // stops early, the stored counter remains just past the opcode, pointing into its
-            // operands.
-            Exit::Unfollowed { pc, .. } if self.from.is_some_and(|from| *pc == from + 1) => None,
-            exit => exit.continues_at(),
-        };
-        let mut next: Vec<Position> = continues.into_iter().collect();
-        for effect in &path.effects {
-            effect.visit_terms(&mut |term| match term {
-                Term::Closure { pc, key, .. } => {
-                    let entry = Position::new(*pc, *key);
-                    if !self.listing.functions.contains(&entry) {
-                        self.listing.functions.push(entry);
-                    }
-                    next.push(entry);
+        let from = self.from.expect("an instruction is being added");
+        let (functions, candidates, found) = (
+            &mut self.listing.functions,
+            &mut self.candidates,
+            &mut self.found,
+        );
+        let next = successors(from, path, |term| match term {
+            Term::Closure { pc, key, .. } => {
+                let entry = Position::new(*pc, *key);
+                if !functions.contains(&entry) {
+                    functions.push(entry);
                 }
-                Term::Array(frame) => next.extend(catch_frame(frame)),
-                Term::Const(Constant::String(text)) if is_state_name(text) => {
-                    self.candidates.insert(text.clone());
-                }
-                _ => {}
-            });
-        }
+            }
+            Term::Const(Constant::String(text))
+                if is_state_name(text) && candidates.insert(text.clone()) =>
+            {
+                *found += 1;
+            }
+            _ => {}
+        });
         for position in next {
             self.enqueue(position)?;
         }
@@ -201,6 +517,7 @@ impl Walk {
     /// Retries unresolved probes with new candidates and queues revealed targets. Returns
     /// whether any target was found.
     fn retry<'a>(&mut self, machine: &Machine<'a>, loaded: &Loaded<'_, 'a>) -> Result<bool> {
+        self.retried = self.found;
         let mut hits = Vec::new();
         for (&(compare, register), probe) in &mut self.probes {
             let mut shortcut = probe.shortcut.as_ref().map(|shortcut| {
@@ -209,12 +526,22 @@ impl Walk {
                     self.hashes.entry(shortcut.field.clone()).or_default(),
                 )
             });
-            for candidate in self.candidates.iter().skip(probe.tried) {
+            // Once its shortcut is dropped, a probe runs the candidates that ruled out, which come
+            // before any it has not been offered.
+            let skipped = if shortcut.is_none() {
+                mem::take(&mut probe.skipped)
+            } else {
+                Vec::new()
+            };
+            let unseen = probe.tried..self.candidates.len();
+            for index in skipped.into_iter().chain(unseen) {
+                let candidate = &self.candidates[index];
                 if let Some((shortcut, hashes)) = &shortcut
                     && hashes
                         .get(candidate)
                         .is_some_and(|&hash| hash != shortcut.expected)
                 {
+                    probe.skipped.push(index);
                     continue;
                 }
                 let known = [(register, Value::string(candidate))];
@@ -266,7 +593,6 @@ impl Walk {
         let mut dropped = false;
         for probe in self.probes.values_mut() {
             if probe.shortcut.take().is_some() {
-                probe.tried = 0;
                 dropped = true;
             }
         }
@@ -412,12 +738,14 @@ fn fuse_method_calls(listing: &mut Listing) {
     // Unrecorded entries, such as functions and hidden targets, start with no known loads.
     let functions = listing.functions.iter().map(|function| function.pc);
     let hidden = listing.hidden.iter().map(|hidden| hidden.target.pc);
-    let incoming = incoming_loads(listing, functions.chain(hidden));
     // Exception continuations also start with no known loads, without erasing the normal path's.
-    let exceptional = incoming_loads(listing, exception_entries(listing));
-    for (pc, instruction) in &mut listing.instructions {
-        let Some(entry) = incoming.get(pc).or_else(|| exceptional.get(pc)) else {
-            continue;
+    let (incoming, exceptional) = both(
+        || incoming_loads(listing, functions.chain(hidden)),
+        || incoming_loads(listing, exception_entries(listing)),
+    );
+    for_each_instruction(listing, |pc, instruction| {
+        let Some(entry) = incoming.get(&pc).or_else(|| exceptional.get(&pc)) else {
+            return;
         };
         for path in &mut instruction.paths {
             let mut loads = entry.clone();
@@ -428,14 +756,49 @@ fn fuse_method_calls(listing: &mut Listing) {
                 update_loads(&mut loads, effect);
             }
         }
-    }
+    });
+}
+
+/// Runs two analyses of a finished listing side by side.
+pub(super) fn both<A: Send, B: Send>(
+    first: impl FnOnce() -> A + Send,
+    second: impl FnOnce() -> B,
+) -> (A, B) {
+    thread::scope(|scope| {
+        let first = scope.spawn(first);
+        let second = second();
+        let first = first
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (first, second)
+    })
+}
+
+/// Rewrites each instruction of a finished listing on its own, on as many threads as decoding
+/// uses. Only what a rewrite is given can affect it, so the threads cannot change the result.
+pub(super) fn for_each_instruction(
+    listing: &mut Listing,
+    work: impl Fn(u32, &mut Instruction) + Sync,
+) {
+    let mut instructions: Vec<_> = listing.instructions.iter_mut().collect();
+    let size = instructions.len().div_ceil(decoding_threads() + 1).max(1);
+    thread::scope(|scope| {
+        for chunk in instructions.chunks_mut(size) {
+            let work = &work;
+            scope.spawn(move || {
+                for (pc, instruction) in chunk {
+                    work(**pc, instruction);
+                }
+            });
+        }
+    });
 }
 
 /// The loads known on entry to each instruction reachable from `entries`.
 fn incoming_loads(
     listing: &Listing,
     entries: impl IntoIterator<Item = u32>,
-) -> BTreeMap<u32, Loads> {
+) -> FxHashMap<u32, Loads> {
     let entries = entries.into_iter().map(|pc| (pc, Loads::default()));
     let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, loads| {
         for effect in &path.effects {

@@ -25,7 +25,7 @@ use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::HashMap;
 use super::analysis::effects::{self, Effects};
-use super::analysis::hoisting::{self, HoistFacts, Hoisted, Hoisting, List};
+use super::analysis::hoisting::{self, HoistFacts, Hoisted, Hoisting, List, Persistent};
 use super::analysis::{self, Analysis, Bindings, Globals, Properties, names};
 use crate::js::ast;
 
@@ -50,7 +50,9 @@ pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
 /// Properties of one helper object that can replace property reads.
 #[derive(Clone, Default)]
 struct ObjectProperties {
-    functions: HashMap<Atom, FnExpr>,
+    /// Functions that only return an expression: the only ones calls to them can be replaced
+    /// by. Shared, because hoisting's snapshots narrow these maps.
+    functions: HashMap<Atom, Rc<FnExpr>>,
     literals: HashMap<Atom, Expr>,
 }
 
@@ -69,9 +71,14 @@ impl ObjectProperties {
     /// Records substitutable properties. Leaves unsupported properties as object reads.
     fn insert(&mut self, name: Atom, value: &Expr) {
         match value {
-            Expr::Fn(function) => {
-                self.functions.insert(name, function.clone());
-            }
+            Expr::Fn(function) => match inlinable(&function.function) {
+                true => {
+                    self.functions.insert(name, Rc::new(function.clone()));
+                }
+                false => {
+                    self.functions.remove(&name);
+                }
+            },
             // A regular expression carries state and identity, so it cannot
             // stand in for every read.
             Expr::Lit(Lit::Regex(_)) => {}
@@ -85,22 +92,40 @@ impl ObjectProperties {
     }
 }
 
+/// Whether calls to `function` could be replaced by what it returns. Anything else is left out of
+/// the helpers rather than copied into them for every snapshot to carry.
+fn inlinable(function: &Function) -> bool {
+    ast::returned(function).is_some()
+}
+
 /// The helper objects and functions known at one point, by binding.
+///
+/// The maps are persistent: hoisting keeps a copy of the known helpers for every statement list
+/// and declaration it passes, which shares rather than copies them.
 #[derive(Clone, Default)]
 struct Helpers {
-    objects: HashMap<Id, Rc<ObjectProperties>>,
+    objects: Persistent<Id, Rc<ObjectProperties>>,
     /// Functions assigned to a binding written once.
-    functions: HashMap<Id, Rc<FnExpr>>,
+    functions: Persistent<Id, Rc<FnExpr>>,
 }
 
 /// At a control-flow join, keeps the objects and properties known on both paths.
 impl HoistFacts for Helpers {
     fn meet(&mut self, other: &Self) {
-        self.objects.retain(|id, properties| {
-            let Some(theirs) = other.objects.get(id) else {
-                return false;
-            };
-            if !Rc::ptr_eq(properties, theirs) {
+        if !self.objects.ptr_eq(&other.objects) {
+            let mut narrowed = Vec::new();
+            self.objects.retain(|id, properties| {
+                let Some(theirs) = other.objects.get(id) else {
+                    return false;
+                };
+                if !Rc::ptr_eq(properties, theirs) {
+                    narrowed.push(id.clone());
+                }
+                true
+            });
+            for id in narrowed {
+                let theirs = &other.objects[&id];
+                let properties = self.objects.get_mut(&id).expect("kept above");
                 let properties = Rc::make_mut(properties);
                 properties
                     .functions
@@ -109,9 +134,11 @@ impl HoistFacts for Helpers {
                     .literals
                     .retain(|name, _| theirs.literals.contains_key(name));
             }
-            true
-        });
-        self.functions.meet(&other.functions);
+        }
+        if !self.functions.ptr_eq(&other.functions) {
+            self.functions
+                .retain(|id, _| other.functions.contains_key(id));
+        }
     }
 }
 
@@ -233,12 +260,16 @@ impl VisitMut for InlineHelpers<'_> {
             // by binding.
             let helpers = &mut self.hoisting.facts;
             if let Some(method) = method {
-                helpers.functions.insert(target, Rc::new(method));
+                helpers.functions.insert(target, method);
             } else if let Some(object) = assignment.right.as_object() {
                 let properties = Rc::new(ObjectProperties::collect(object));
                 helpers.objects.insert(target, properties);
             } else if let Some(function) = assignment.right.as_fn_expr() {
-                helpers.functions.insert(target, Rc::new(function.clone()));
+                if inlinable(&function.function) {
+                    helpers.functions.insert(target, Rc::new(function.clone()));
+                } else {
+                    helpers.functions.remove(&target);
+                }
             } else if let Some(alias) = assignment.right.as_ident()
                 && let Some(object) = helpers.objects.get(&alias.to_id()).cloned()
             {
@@ -256,6 +287,7 @@ impl VisitMut for InlineHelpers<'_> {
         if self.hoisting.list == List::FunctionBody {
             for statement in statements.iter() {
                 if let Stmt::Decl(Decl::Fn(declaration)) = statement
+                    && inlinable(&declaration.function)
                     && self.bindings.is_written_once(&declaration.ident.to_id())
                 {
                     let function = Rc::new(FnExpr::from(declaration.function.clone()));
