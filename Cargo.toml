@@ -78,7 +78,7 @@ imbl = "7.0.2"
 
 # The address space `Allocator`'s chunks come from, reserved and committed on Windows.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_Performance"] }
 
 # Installs `cfsolve::Allocator` as its global allocator, so it runs in a process of its own.
 [[test]]
@@ -92,9 +92,6 @@ libc = "0.2.189"
 
 # `QueryPerformanceCounter`, the time base Chrome's `performance.now()` is derived from on
 # Windows.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
-
 # Chrome 154's ClientHello: ML-DSA and GREASE signature algorithms and the
 # trust_anchors extension, which the published crates cannot send. See the
 # "cfsolve patch" comments in vendor/.

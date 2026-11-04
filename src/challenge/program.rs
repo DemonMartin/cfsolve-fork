@@ -727,6 +727,7 @@ mod tests {
                 default: Startup::default(),
                 optional: Startup::default(),
                 in_optional: false,
+                constants: Vec::new(),
             };
             parsed.script.visit_with(&mut components);
             let Components {
